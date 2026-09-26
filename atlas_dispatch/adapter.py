@@ -45,7 +45,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -2894,118 +2894,166 @@ def _with_classification(result: AdapterResult) -> AdapterResult:
 # --------------------------------------------------------------------------- #
 
 
-def classify_result(result: AdapterResult) -> Classification:
-    """Inspect the result and return a Classification.
+@dataclass(frozen=True)
+class _ClassifyContext:
+    """Everything classify_result's checks share, normalised once.
 
-    Order matters. Codex lifecycle states are surfaced before generic
-    subprocess signals, followed by timeout > executable not found >
-    auth required > quota exhausted > rate limited > overloaded > scoped
-    refusal > generic refusal > exit nonzero > model selection error > no
-    output > success.
+    The haystacks are tail-biased slices (at most MAX_CLASSIFY_HAYSTACK
+    characters) so a multi-MB stdout is never concatenated and lower-cased in
+    full: error signals cluster near the end of CLI output.
     """
+
+    result: AdapterResult
+    cli: str
+    definition: CLIDefinition | None
+    # stderr + "\n" + stdout, tail-sliced: original case (a quota pattern
+    # captures its reset window verbatim) and lower-cased (everything else).
+    quota_haystack: str
+    haystack: str
+    # stdout only, tail-sliced and lower-cased: an exit-zero refusal counts
+    # only if the model said it, not if a tool printed it to stderr.
+    refusal_haystack: str
+    # A clean, completed Codex turn: stale error_info on it is ignored.
+    clean_completed_turn: bool
+    quota_patterns: tuple[str, ...]
+    rate_patterns: list[str]
+    auth_patterns: list[str]
+    overload_patterns: list[str]
+    refusal_patterns: list[str]
+
+
+def _classify_context(result: AdapterResult) -> _ClassifyContext:
     cli = result.cli.lower()
     definition = CLIS.get(cli)
 
     rate_patterns = list(GENERIC_RATE_LIMIT_PATTERNS)
+    auth_patterns = list(GENERIC_AUTH_PATTERNS)
+    overload_patterns = list(GENERIC_OVERLOADED_PATTERNS)
+    refusal_patterns = list(GENERIC_REFUSAL_PATTERNS)
     quota_patterns: tuple[str, ...] = ()
     if definition is not None:
         rate_patterns.extend(definition.extra_rate_limit_patterns)
+        auth_patterns.extend(definition.extra_auth_patterns)
+        overload_patterns.extend(definition.extra_overloaded_patterns)
+        refusal_patterns.extend(definition.extra_refusal_patterns)
         quota_patterns = definition.extra_quota_exhausted_patterns
 
-    # Avoid concatenating and lowering multi-MB strings in one shot.
-    # Error signals (auth, rate-limit, overload) are usually near the end
-    # of output, so tail-biased sampling is safe.
-    _haystack_raw = result.stderr + "\n" + result.stdout
-    if len(_haystack_raw) > MAX_CLASSIFY_HAYSTACK:
-        _haystack_raw = _haystack_raw[-MAX_CLASSIFY_HAYSTACK:]
-    quota_haystack = _haystack_raw
-    haystack = _haystack_raw.lower()
-    del _haystack_raw
+    quota_haystack = result.stderr + "\n" + result.stdout
+    if len(quota_haystack) > MAX_CLASSIFY_HAYSTACK:
+        quota_haystack = quota_haystack[-MAX_CLASSIFY_HAYSTACK:]
+    refusal_raw = result.stdout
+    if len(refusal_raw) > MAX_CLASSIFY_HAYSTACK:
+        refusal_raw = refusal_raw[-MAX_CLASSIFY_HAYSTACK:]
 
-    _refusal_raw = result.stdout
-    if len(_refusal_raw) > MAX_CLASSIFY_HAYSTACK:
-        _refusal_raw = _refusal_raw[-MAX_CLASSIFY_HAYSTACK:]
-    refusal_haystack = _refusal_raw.lower()
-    del _refusal_raw
-
-    if result.idle_classification == "approval_blocked":
-        return Classification(
-            kind=DispatchErrorKind.APPROVAL_BLOCKED,
-            suggested_action=(
-                "`codex` emitted an approval-required lifecycle event. Inspect "
-                "cli.summary.json turn_lifecycle and rerun after adjusting "
-                "Codex approval/sandbox settings; atlas-dispatch did not "
-                "auto-approve it."
-            ),
-        )
-
-    if result.idle_classification == "stalled":
-        return Classification(
-            kind=DispatchErrorKind.STALLED,
-            suggested_action=(
-                "`codex` turn stayed in progress without lifecycle events past "
-                "idle_timeout_seconds. Retry the dispatch or split the task if "
-                "it repeatedly stalls."
-            ),
-        )
-
-    clean_completed_turn = (
-        result.exit_code == 0 and result.final_turn_status == "completed"
+    return _ClassifyContext(
+        result=result,
+        cli=cli,
+        definition=definition,
+        quota_haystack=quota_haystack,
+        haystack=quota_haystack.lower(),
+        refusal_haystack=refusal_raw.lower(),
+        clean_completed_turn=(
+            result.exit_code == 0 and result.final_turn_status == "completed"
+        ),
+        quota_patterns=quota_patterns,
+        rate_patterns=rate_patterns,
+        auth_patterns=auth_patterns,
+        overload_patterns=overload_patterns,
+        refusal_patterns=refusal_patterns,
     )
-    if not clean_completed_turn and _codex_error_code(result.error_info) == "-32001":
-        return Classification(
-            kind=DispatchErrorKind.OVERLOADED,
-            suggested_action=(
-                "`codex` reported server overload (-32001). Wait and retry."
-            ),
-        )
 
-    # A hard usage/quota stop surfaces as a *failed turn* whose only evidence is
-    # error_info.message -- stdout and stderr are empty, so the pattern scan over
-    # `haystack` below never sees it. Classify it here, ahead of the generic
-    # failed-turn catch-all, or the reader is told to "retry after the
-    # underlying model/runtime issue is resolved" when the correct action is to
-    # wait for the quota reset or hand the task to a different CLI.
-    error_message = _error_info_message(result.error_info)
-    if error_message and not clean_completed_turn:
-        quota_evidence = _quota_exhaustion_evidence(
-            error_message,
-            quota_patterns,
-        )
-        if quota_evidence is not None:
-            return _quota_exhausted_classification(
-                cli=cli,
-                evidence=quota_evidence,
-            )
-        matched = _first_match(error_message.lower(), rate_patterns)
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.RATE_LIMITED,
-                suggested_action=(
-                    f"`{cli}` reported a usage/rate limit. Wait for the quota to "
-                    "reset, switch to a different CLI/model for this task, or "
-                    "split the work."
-                ),
-                matched_pattern=matched,
-            )
 
-    # A non-zero run may include explanatory text around its quota failure, so
-    # retain the broad scan used for failure output. An exit-zero response must
-    # be more discriminating: successful work about this classifier can quote
-    # the exact vendor text in prose. Only treat exit-zero output as exhausted
-    # when the banner occupies the complete final non-empty line.
-    quota_evidence = (
-        _terminal_quota_exhaustion_evidence(quota_haystack, quota_patterns)
-        if result.exit_code == 0
-        else _quota_exhaustion_evidence(quota_haystack, quota_patterns)
+def _check_approval_blocked(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.idle_classification != "approval_blocked":
+        return None
+    return Classification(
+        kind=DispatchErrorKind.APPROVAL_BLOCKED,
+        suggested_action=(
+            "`codex` emitted an approval-required lifecycle event. Inspect "
+            "cli.summary.json turn_lifecycle and rerun after adjusting "
+            "Codex approval/sandbox settings; atlas-dispatch did not "
+            "auto-approve it."
+        ),
     )
+
+
+def _check_stalled(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.idle_classification != "stalled":
+        return None
+    return Classification(
+        kind=DispatchErrorKind.STALLED,
+        suggested_action=(
+            "`codex` turn stayed in progress without lifecycle events past "
+            "idle_timeout_seconds. Retry the dispatch or split the task if "
+            "it repeatedly stalls."
+        ),
+    )
+
+
+def _check_codex_overload_code(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.clean_completed_turn:
+        return None
+    if _codex_error_code(ctx.result.error_info) != "-32001":
+        return None
+    return Classification(
+        kind=DispatchErrorKind.OVERLOADED,
+        suggested_action=(
+            "`codex` reported server overload (-32001). Wait and retry."
+        ),
+    )
+
+
+def _check_failed_turn_error_info(ctx: _ClassifyContext) -> Classification | None:
+    """Quota or rate limit reported only in a failed turn's error_info.
+
+    A hard usage/quota stop surfaces as a *failed turn* whose only evidence is
+    error_info.message -- stdout and stderr are empty, so the output scans
+    never see it. It must be classified ahead of the generic failed-turn
+    check, or the reader is told to "retry after the underlying model/runtime
+    issue is resolved" when the correct action is to wait for the quota reset
+    or hand the task to a different CLI.
+    """
+    error_message = _error_info_message(ctx.result.error_info)
+    if not error_message or ctx.clean_completed_turn:
+        return None
+    quota_evidence = _quota_exhaustion_evidence(error_message, ctx.quota_patterns)
     if quota_evidence is not None:
-        return _quota_exhausted_classification(
-            cli=cli,
-            evidence=quota_evidence,
-        )
+        return _quota_exhausted_classification(cli=ctx.cli, evidence=quota_evidence)
+    matched = _first_match(error_message.lower(), ctx.rate_patterns)
+    if not matched:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.RATE_LIMITED,
+        suggested_action=(
+            f"`{ctx.cli}` reported a usage/rate limit. Wait for the quota to "
+            "reset, switch to a different CLI/model for this task, or "
+            "split the work."
+        ),
+        matched_pattern=matched,
+    )
 
-    if result.final_turn_status == "failed":
+
+def _check_quota_banner(ctx: _ClassifyContext) -> Classification | None:
+    """A vendor quota banner in stderr or stdout.
+
+    A non-zero run may include explanatory text around its quota failure, so
+    it gets the broad scan. An exit-zero response must be more discriminating:
+    successful work about this classifier can quote the exact vendor text in
+    prose, so exit-zero output counts only when the banner occupies the
+    complete final non-empty line.
+    """
+    quota_evidence = (
+        _terminal_quota_exhaustion_evidence(ctx.quota_haystack, ctx.quota_patterns)
+        if ctx.result.exit_code == 0
+        else _quota_exhaustion_evidence(ctx.quota_haystack, ctx.quota_patterns)
+    )
+    if quota_evidence is None:
+        return None
+    return _quota_exhausted_classification(cli=ctx.cli, evidence=quota_evidence)
+
+
+def _check_codex_turn_status(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.final_turn_status == "failed":
         return Classification(
             kind=DispatchErrorKind.FAILED,
             suggested_action=(
@@ -3014,8 +3062,7 @@ def classify_result(result: AdapterResult) -> Classification:
                 "model/runtime issue is resolved."
             ),
         )
-
-    if result.final_turn_status == "interrupted":
+    if ctx.result.final_turn_status == "interrupted":
         return Classification(
             kind=DispatchErrorKind.INTERRUPTED,
             suggested_action=(
@@ -3023,163 +3070,244 @@ def classify_result(result: AdapterResult) -> Classification:
                 "unless someone intentionally interrupted it."
             ),
         )
+    return None
 
-    if result.timed_out:
+
+def _check_timeout(ctx: _ClassifyContext) -> Classification | None:
+    if not ctx.result.timed_out:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.TIMEOUT,
+        suggested_action=(
+            f"The {ctx.cli} run exceeded the task's timeout. Consider raising "
+            "`timeout_seconds` in the task spec, or splitting the task "
+            "into smaller pieces."
+        ),
+    )
+
+
+def _check_executable_not_found(ctx: _ClassifyContext) -> Classification | None:
+    if not ctx.result.executable_not_found:
+        return None
+    executable = ctx.definition.executable if ctx.definition else ctx.cli
+    return Classification(
+        kind=DispatchErrorKind.EXECUTABLE_NOT_FOUND,
+        suggested_action=(
+            f"`{executable}` is not on PATH. "
+            "Install the CLI or set "
+            f"{_cli_env_override_name(ctx.cli)} to a working invocation."
+        ),
+    )
+
+
+def _check_failure_output_patterns(ctx: _ClassifyContext) -> Classification | None:
+    """Auth, then rate limit, then overload wording -- for a non-zero exit only."""
+    if ctx.result.exit_code == 0:
+        return None
+
+    matched = _first_match(ctx.haystack, ctx.auth_patterns)
+    if matched:
+        hint = (
+            ctx.definition.auth_setup_hint
+            if ctx.definition is not None
+            else f"Refresh authentication for `{ctx.cli}` and try again."
+        )
         return Classification(
-            kind=DispatchErrorKind.TIMEOUT,
-            suggested_action=(
-                f"The {cli} run exceeded the task's timeout. Consider raising "
-                "`timeout_seconds` in the task spec, or splitting the task "
-                "into smaller pieces."
-            ),
+            kind=DispatchErrorKind.AUTH_REQUIRED,
+            suggested_action=hint,
+            matched_pattern=matched,
         )
 
-    if result.executable_not_found:
+    matched = _first_match(ctx.haystack, ctx.rate_patterns)
+    if matched:
         return Classification(
-            kind=DispatchErrorKind.EXECUTABLE_NOT_FOUND,
+            kind=DispatchErrorKind.RATE_LIMITED,
             suggested_action=(
-                f"`{definition.executable if definition else cli}` is not on PATH. "
-                "Install the CLI or set "
-                f"{_cli_env_override_name(cli)} to a working invocation."
+                f"`{ctx.cli}` returned a rate-limit signal. Wait and retry, "
+                "switch to a different CLI/model for this task, or split "
+                "the work."
             ),
+            matched_pattern=matched,
         )
 
-    auth_patterns = list(GENERIC_AUTH_PATTERNS)
-    overload_patterns = list(GENERIC_OVERLOADED_PATTERNS)
-    refusal_patterns = list(GENERIC_REFUSAL_PATTERNS)
-    if definition is not None:
-        auth_patterns.extend(definition.extra_auth_patterns)
-        overload_patterns.extend(definition.extra_overloaded_patterns)
-        refusal_patterns.extend(definition.extra_refusal_patterns)
-
-    if result.exit_code != 0:
-        matched = _first_match(haystack, auth_patterns)
-        if matched:
-            hint = (
-                definition.auth_setup_hint
-                if definition is not None
-                else f"Refresh authentication for `{cli}` and try again."
-            )
-            return Classification(
-                kind=DispatchErrorKind.AUTH_REQUIRED,
-                suggested_action=hint,
-                matched_pattern=matched,
-            )
-
-        matched = _first_match(haystack, rate_patterns)
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.RATE_LIMITED,
-                suggested_action=(
-                    f"`{cli}` returned a rate-limit signal. Wait and retry, "
-                    "switch to a different CLI/model for this task, or split "
-                    "the work."
-                ),
-                matched_pattern=matched,
-            )
-
-        matched = _first_match(haystack, overload_patterns)
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.OVERLOADED,
-                suggested_action=(
-                    f"`{cli}` reported a server-side overload (5xx). Wait a few "
-                    "minutes and retry; if persistent, try a different CLI."
-                ),
-                matched_pattern=matched,
-            )
-
-    scope_refusal_reason = out_of_scope_refusal_reason(result.stdout)
-    if scope_refusal_reason:
+    matched = _first_match(ctx.haystack, ctx.overload_patterns)
+    if matched:
         return Classification(
-            kind=DispatchErrorKind.REFUSED_OUT_OF_SCOPE,
+            kind=DispatchErrorKind.OVERLOADED,
             suggested_action=(
-                "The builder intentionally stopped at the task scope boundary. "
-                f"Builder reason: {scope_refusal_reason}"
+                f"`{ctx.cli}` reported a server-side overload (5xx). Wait a few "
+                "minutes and retry; if persistent, try a different CLI."
             ),
-            matched_pattern=_first_match(
-                result.stdout.casefold(), OUT_OF_SCOPE_REFUSAL_PATTERNS
-            ),
+            matched_pattern=matched,
         )
+    return None
 
-    if result.exit_code != 0 or result.final_turn_status != "completed":
-        refusal_source = haystack if result.exit_code != 0 else refusal_haystack
-        matched = _first_match(refusal_source, refusal_patterns)
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.REFUSED,
-                suggested_action=(
-                    f"`{cli}` refused the task. Reword the prompt to be more "
-                    "concrete, narrow the scope, or hand the task to a different "
-                    "CLI/model."
-                ),
-                matched_pattern=matched,
-            )
 
+def _check_scope_refusal(ctx: _ClassifyContext) -> Classification | None:
+    scope_refusal_reason = out_of_scope_refusal_reason(ctx.result.stdout)
+    if not scope_refusal_reason:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.REFUSED_OUT_OF_SCOPE,
+        suggested_action=(
+            "The builder intentionally stopped at the task scope boundary. "
+            f"Builder reason: {scope_refusal_reason}"
+        ),
+        matched_pattern=_first_match(
+            ctx.result.stdout.casefold(), OUT_OF_SCOPE_REFUSAL_PATTERNS
+        ),
+    )
+
+
+def _check_refusal(ctx: _ClassifyContext) -> Classification | None:
+    """Refusal wording; for exit 0, in stdout only. Skipped for a clean turn."""
+    result = ctx.result
+    if result.exit_code == 0 and result.final_turn_status == "completed":
+        return None
+    refusal_source = ctx.haystack if result.exit_code != 0 else ctx.refusal_haystack
+    matched = _first_match(refusal_source, ctx.refusal_patterns)
+    if not matched:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.REFUSED,
+        suggested_action=(
+            f"`{ctx.cli}` refused the task. Reword the prompt to be more "
+            "concrete, narrow the scope, or hand the task to a different "
+            "CLI/model."
+        ),
+        matched_pattern=matched,
+    )
+
+
+def _check_post_completion_timeout(ctx: _ClassifyContext) -> Classification | None:
+    """A non-zero exit accepted as success: the run produced its declared
+    deliverable, then hit the CLI's known post-completion response timeout.
+    The raw exit code is kept as observed_exit_code."""
+    result = ctx.result
+    definition = ctx.definition
     if (
-        result.exit_code != 0
-        and result.produced_expected_deliverable
-        and definition is not None
+        result.exit_code == 0
+        or not result.produced_expected_deliverable
+        or definition is None
     ):
-        matched = _first_match(
-            haystack,
-            definition.extra_post_completion_timeout_patterns,
-        )
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.SUCCESS,
-                suggested_action=(
-                    f"`{definition.executable}` exited with code "
-                    f"{result.exit_code} after producing the expected "
-                    "deliverable, then reported its post-completion response "
-                    "timeout. The raw non-zero process exit is retained in "
-                    "classification and run-identity evidence."
-                ),
-                matched_pattern=matched,
-                observed_exit_code=result.exit_code,
-            )
+        return None
+    matched = _first_match(
+        ctx.haystack,
+        definition.extra_post_completion_timeout_patterns,
+    )
+    if not matched:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.SUCCESS,
+        suggested_action=(
+            f"`{definition.executable}` exited with code "
+            f"{result.exit_code} after producing the expected "
+            "deliverable, then reported its post-completion response "
+            "timeout. The raw non-zero process exit is retained in "
+            "classification and run-identity evidence."
+        ),
+        matched_pattern=matched,
+        observed_exit_code=result.exit_code,
+    )
 
-    if result.exit_code != 0:
-        return Classification(
-            kind=DispatchErrorKind.EXIT_NONZERO,
-            suggested_action=(
-                f"`{cli}` exited with code {result.exit_code}. Inspect "
-                "cli.stderr.txt in the run directory for the exact error."
-            ),
-        )
 
-    if definition is not None and len(result.stdout) <= MAX_CLASSIFY_HAYSTACK:
-        matched = _first_match(
-            result.stdout,
-            definition.model_selection_error_patterns,
-        )
-        if matched:
-            return Classification(
-                kind=DispatchErrorKind.MODEL_SELECTION_ERROR,
-                suggested_action=(
-                    f"`{cli}` did not run the task because the selected model "
-                    "does not exist or is not accessible. Correct the model id "
-                    "or choose a different model, then retry."
-                ),
-                matched_pattern=matched,
-            )
+def _check_exit_nonzero(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.exit_code == 0:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.EXIT_NONZERO,
+        suggested_action=(
+            f"`{ctx.cli}` exited with code {ctx.result.exit_code}. Inspect "
+            "cli.stderr.txt in the run directory for the exact error."
+        ),
+    )
 
-    if result.final_turn_status == "completed":
-        return Classification(
-            kind=DispatchErrorKind.SUCCESS,
-            suggested_action="",
-        )
 
-    if not result.stdout.strip():
-        return Classification(
-            kind=DispatchErrorKind.NO_OUTPUT,
-            suggested_action=(
-                f"`{cli}` exited 0 but produced no stdout. Many CLIs emit a "
-                "summary to stdout; check that the task prompt was actually "
-                "received and that the CLI's quiet/print flags are right."
-            ),
-        )
+# Every check below sees an exit-zero result: _check_exit_nonzero has already
+# returned for anything else.
 
+
+def _check_model_selection_error(ctx: _ClassifyContext) -> Classification | None:
+    """Exit 0 whose whole stdout is the CLI's "no such model" message."""
+    if ctx.definition is None or len(ctx.result.stdout) > MAX_CLASSIFY_HAYSTACK:
+        return None
+    matched = _first_match(
+        ctx.result.stdout,
+        ctx.definition.model_selection_error_patterns,
+    )
+    if not matched:
+        return None
+    return Classification(
+        kind=DispatchErrorKind.MODEL_SELECTION_ERROR,
+        suggested_action=(
+            f"`{ctx.cli}` did not run the task because the selected model "
+            "does not exist or is not accessible. Correct the model id "
+            "or choose a different model, then retry."
+        ),
+        matched_pattern=matched,
+    )
+
+
+def _check_completed_turn(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.final_turn_status != "completed":
+        return None
+    return Classification(kind=DispatchErrorKind.SUCCESS, suggested_action="")
+
+
+def _check_no_output(ctx: _ClassifyContext) -> Classification | None:
+    if ctx.result.stdout.strip():
+        return None
+    return Classification(
+        kind=DispatchErrorKind.NO_OUTPUT,
+        suggested_action=(
+            f"`{ctx.cli}` exited 0 but produced no stdout. Many CLIs emit a "
+            "summary to stdout; check that the task prompt was actually "
+            "received and that the CLI's quiet/print flags are right."
+        ),
+    )
+
+
+# The classification ORDER. The first check that returns a Classification
+# wins. docs/FAILURE_MODES.md documents this sequence row by row, and
+# tests/test_classifier_order.py pins each adjacent pair.
+_CLASSIFICATION_CHECKS: tuple[
+    Callable[[_ClassifyContext], Classification | None], ...
+] = (
+    _check_approval_blocked,
+    _check_stalled,
+    _check_codex_overload_code,
+    _check_failed_turn_error_info,
+    _check_quota_banner,
+    _check_codex_turn_status,
+    _check_timeout,
+    _check_executable_not_found,
+    _check_failure_output_patterns,
+    _check_scope_refusal,
+    _check_refusal,
+    _check_post_completion_timeout,
+    _check_exit_nonzero,
+    _check_model_selection_error,
+    _check_completed_turn,
+    _check_no_output,
+)
+
+
+def classify_result(result: AdapterResult) -> Classification:
+    """Inspect the result and return a Classification.
+
+    Order matters: the checks in _CLASSIFICATION_CHECKS run in sequence and the
+    first match wins. Codex lifecycle signals come first (approval, stall,
+    overload code, quota or rate limit in error_info), then a quota banner in
+    the output, the Codex turn status, timeout, missing executable, the
+    non-zero-exit auth > rate limit > overload scan, scoped refusal, generic
+    refusal, post-completion-timeout success, other non-zero exits, model
+    selection error, a completed turn, and no output. Anything left is success.
+    """
+    context = _classify_context(result)
+    for check in _CLASSIFICATION_CHECKS:
+        classification = check(context)
+        if classification is not None:
+            return classification
     return Classification(
         kind=DispatchErrorKind.SUCCESS,
         suggested_action="",

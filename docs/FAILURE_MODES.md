@@ -52,6 +52,16 @@ a 401 is an auth problem, not a generic failure.
 "Output" below means stderr and stdout together, searched case-insensitively and tail-biased to the
 last 256 KB (errors cluster at the end, and lower-casing a multi-megabyte string doubles memory).
 
+In code, the order is the tuple `_CLASSIFICATION_CHECKS`: small `_check_*` functions, each returning
+a `Classification` or `None`, which `classify_result()` walks in sequence over a `_ClassifyContext`
+that normalises the text once. Rows map to checks as follows: 1 `_check_approval_blocked`,
+2 `_check_stalled`, 3 `_check_codex_overload_code`, 4–5 `_check_failed_turn_error_info`,
+6 `_check_quota_banner`, 7–8 `_check_codex_turn_status`, 9 `_check_timeout`,
+10 `_check_executable_not_found`, 11–13 `_check_failure_output_patterns`, 14 `_check_scope_refusal`,
+15 `_check_refusal`, 16 `_check_post_completion_timeout`, 17 `_check_exit_nonzero`,
+18 `_check_model_selection_error`, 19 `_check_completed_turn`, 20 `_check_no_output`; row 21 is the
+fall-through. `tests/test_classifier_order.py` pins each adjacent pair of this order.
+
 | # | Kind | Trigger | Suggested action (from the code) |
 |---|---|---|---|
 | 1 | `approval_blocked` | Codex JSONL: the turn emitted an approval-required event. The harness terminates the run; nobody is there to approve. | Inspect `turn_lifecycle` in `cli.summary.json`; adjust Codex approval/sandbox settings and rerun. |
@@ -160,3 +170,7 @@ Patterns are added from real output, one failure at a time:
    vendor's error prefix over a bare keyword; `quota` alone matches too much prose.
 3. Add a test in `tests/test_classifier.py` that feeds the captured text verbatim, plus a
    must-not-fire case where a successful run quotes the same words.
+
+A new *kind* of check is a new `_check_*` function placed at the right position in
+`_CLASSIFICATION_CHECKS`, with a test in `tests/test_classifier_order.py` for each neighbour it now
+sits between, and a row in the table above.
