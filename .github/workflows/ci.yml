@@ -17,6 +17,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+      # Some worktree tests build isolated venvs with uv.
+      - uses: astral-sh/setup-uv@v10
       # A project-local .venv, as in the README. One test probes that this
       # checkout's own .venv imports atlas_dispatch from the checkout.
       - name: Install
@@ -24,7 +26,7 @@ jobs:
           python -m venv .venv
           .venv/bin/python -m pip install -e . pytest
       - name: Test
-        run: .venv/bin/python -m pytest -q
+        run: .venv/bin/python -m pytest -q -rs
       - name: Entry points
         run: |
           .venv/bin/python -c "import atlas_dispatch"
