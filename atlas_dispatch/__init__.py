@@ -41,13 +41,10 @@ from atlas_dispatch.adapter import (
     resolve_model,
     run_cli,
 )
-from atlas_dispatch.dispatcher import (
-    McpRuntime,
-    TaskSpec,
-    dispatch,
-    load_task,
-    render_prompt,
-)
+from atlas_dispatch.dispatcher import dispatch
+from atlas_dispatch.mcp_config import McpRuntime
+from atlas_dispatch.prompt import render_prompt
+from atlas_dispatch.task_spec import TaskSpec, load_task
 from atlas_dispatch.verify import (
     PROTECTED_PATTERNS,
     CheckResult,

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      # A project-local .venv, as in the README. One test probes that this
+      # checkout's own .venv imports atlas_dispatch from the checkout.
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e . pytest
+      - name: Test
+        run: .venv/bin/python -m pytest -q
+      - name: Entry points
+        run: |
+          .venv/bin/python -c "import atlas_dispatch"
+          .venv/bin/atlas-dispatch --help
+          .venv/bin/atlas-dispatch run --help
+          .venv/bin/atlas-dispatch doctor

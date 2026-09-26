@@ -24,7 +24,6 @@ PREDISPATCH_GIT_LOCK_CONTENTION_KIND = "git_lock_contention"
 PREDISPATCH_GIT_LOCK_CONTENTION_SUGGESTED_ACTION = (
     "Transient pre-dispatch git index lock contention; retry or redispatch."
 )
-_SUBPROCESS_RUN = subprocess.run
 _INDEX_LOCK_RE = re.compile(
     r"(?:^|[/\\])index\.lock\b|another git process seems to be running|could not lock index",
     re.IGNORECASE,
@@ -106,33 +105,23 @@ def run_git(
             stdout=stdout,
             stderr=timeout_stderr,
         )
-    except TypeError as exc:
-        # Some test doubles for subprocess.run accept only a narrow set of
-        # kwargs. Retry only those patched runners; real git subprocesses
-        # always receive the hardened env and timeout.
-        if run is _SUBPROCESS_RUN or "unexpected keyword argument" not in str(exc):
-            raise
-        legacy_kwargs = dict(kwargs)
-        legacy_kwargs.pop("timeout", None)
-        legacy_kwargs.pop("env", None)
-        legacy_kwargs.pop("executable", None)
-        try:
-            return run(command, **legacy_kwargs)
-        except subprocess.TimeoutExpired as timeout_exc:
-            stdout = _timeout_stream_to_text(timeout_exc.stdout)
-            stderr = _timeout_stream_to_text(timeout_exc.stderr)
-            timeout_stderr = (
-                f"git command timed out after {effective_timeout} seconds: "
-                f"{' '.join(command)}"
-            )
-            if stderr:
-                timeout_stderr = f"{stderr}\n{timeout_stderr}"
-            return subprocess.CompletedProcess(
-                command,
-                124,
-                stdout=stdout,
-                stderr=timeout_stderr,
-            )
+
+
+
+def run_git_in(repo: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run ``git <args>`` in ``repo`` and return the result without raising.
+
+    The dispatcher's git reads all go through this one helper, so they share
+    the watchdog and non-interactive environment of ``run_git``.
+    """
+
+    return run_git(args, cwd=repo, check=False)
+
+
+def git_result_error(result: subprocess.CompletedProcess[str]) -> str:
+    """The most useful one-line description of a failed git call."""
+
+    return (result.stderr or result.stdout or f"git exited {result.returncode}").strip()
 
 
 def _resolve_git_binary(env: Mapping[str, str]) -> str:

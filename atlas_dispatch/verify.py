@@ -127,24 +127,12 @@ class VerificationState(StrEnum):
     VERIFIED_PASS = "VERIFIED_PASS"
     VERIFIED_FAIL = "VERIFIED_FAIL"
     NOT_RUN_NO_CHANGE = "NOT_RUN_NO_CHANGE"
-    NOT_RUN_SPEC_DEFECT = "NOT_RUN_SPEC_DEFECT"
 
 
 # The import-provenance guard's two refusal verdicts. No executed acceptance
 # command can produce either value, so membership in this set means the guard
 # refused before any acceptance command ran.
 _PROVENANCE_REFUSAL_CLASSIFICATIONS = frozenset({"stale_import_binding", "unknown"})
-
-
-def parse_verification_state(value: object) -> VerificationState | None:
-    """Return an exact supported state without coercing unknown input."""
-
-    if not isinstance(value, str):
-        return None
-    try:
-        return VerificationState(value)
-    except ValueError:
-        return None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -202,9 +190,9 @@ class VerifyReport:
     def verification_state(self) -> VerificationState | None:
         """Return the discriminated state directly supported by this report.
 
-        A skipped report is automatically classified only for an empty diff.
-        Declaring a spec defective requires separately recorded, audited
-        provenance; an ordinary skip must not manufacture that judgment.
+        A skipped report is classified only for an empty diff; any other skip
+        returns None, because the report cannot say more than that acceptance
+        did not run.
         """
 
         if self.acceptance_outcome == "not_attempted":

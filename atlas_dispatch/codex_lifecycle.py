@@ -89,7 +89,6 @@ CodexTypedEvent = (
 class CodexLifecycleState:
     current_turn_status: TurnStatus | None = None
     last_event_at: float | None = None
-    current_item: dict[str, Any] | None = None
     accumulated_token_usage: dict[str, int] = field(default_factory=dict)
     error_info: dict[str, Any] | None = None
     approval_required: bool = False
@@ -146,7 +145,6 @@ def apply_codex_event(
 
     if normalized == "item.started":
         item = _dict_value(payload.get("item"))
-        state.current_item = item
         typed.append(
             ItemStarted(
                 event=event,
@@ -158,14 +156,12 @@ def apply_codex_event(
         return typed
 
     if normalized == "item.updated":
-        item = _dict_value(payload.get("item"))
-        if item:
-            state.current_item = item
+        # Progress within an item; it proves liveness (last_event_at, set
+        # above) but changes no lifecycle state.
         return typed
 
     if normalized == "item.completed":
         item = _dict_value(payload.get("item"))
-        state.current_item = item
         typed.append(
             ItemCompleted(
                 event=event,

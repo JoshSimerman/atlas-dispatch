@@ -175,9 +175,9 @@ def test_main_appearing_during_the_run_is_a_finding(tmp_path: Path) -> None:
 def test_unreadable_local_protected_ref_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import atlas_dispatch.dispatcher as dispatcher_mod
+    import atlas_dispatch.ref_guard as ref_guard_mod
 
-    real_run_git = dispatcher_mod._run_git
+    real_run_git = ref_guard_mod.run_git_in
 
     def corrupt_main(repo: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
         if args[:1] == ["rev-parse"] and any("refs/heads/main" in a for a in args):
@@ -193,7 +193,7 @@ def test_unreadable_local_protected_ref_fails_closed(
     (work / "seed.txt").write_text("seed\n", encoding="utf-8")
     _git(work, "add", "seed.txt")
     _git(work, "commit", "-m", "seed")
-    monkeypatch.setattr(dispatcher_mod, "_run_git", corrupt_main)
+    monkeypatch.setattr(ref_guard_mod, "run_git_in", corrupt_main)
 
     snapshot = _capture_orchestrator_refs(work)
     findings = _diff_orchestrator_refs(snapshot, snapshot)

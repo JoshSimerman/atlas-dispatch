@@ -26,7 +26,6 @@ from atlas_dispatch.adapter import (
     DispatchErrorKind,
     QuotaResetWindowProvenance,
     classify_result,
-    cli_doctor,
     render_command,
     resolve_invocation,
     run_cli,

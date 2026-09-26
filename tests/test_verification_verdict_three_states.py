@@ -140,8 +140,7 @@ def test_a_no_op_run_is_described_as_nothing_built_not_as_unverified_code() -> N
     A CLI that produced no changes has no code to verify; a CLI killed mid-suite
     has code nobody checked. Both are NOT_ATTEMPTED, but telling a reviewer "no
     evidence about the code" when there IS no code is the same collapse one level
-    down. The governed VerificationState vocabulary already separates
-    NOT_RUN_NO_CHANGE from NOT_RUN_SPEC_DEFECT.
+    down. verify.VerificationState keeps the same distinction (NOT_RUN_NO_CHANGE).
     """
     state, reason = verification_verdict(
         VerifyReport(

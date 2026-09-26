@@ -34,8 +34,6 @@ line in the report rather than a raw stack trace.
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import hashlib
 import json
 import os
@@ -149,14 +147,12 @@ class DispatchErrorKind(StrEnum):
     REFUSED_OUT_OF_SCOPE = "refused_out_of_scope"
     MODEL_SELECTION_ERROR = "model_selection_error"
     NO_OUTPUT = "no_output"
-    UNKNOWN_FAILURE = "unknown_failure"
 
 
 class QuotaResetWindowProvenance(StrEnum):
     """Authority for a concrete quota-reset window, never for an unknown one."""
 
     VENDOR_DECLARED = "vendor-declared"
-    LOCALLY_INFERRED = "locally-inferred"
 
 
 class CodexRuntimeMode(StrEnum):
@@ -1296,7 +1292,7 @@ class CodexClient(Protocol):
 
 
 class SubprocessCodexClient:
-    """Current P1 `codex exec --json` implementation behind CodexClient."""
+    """Runs `codex exec --json` as a subprocess and parses its JSONL lifecycle."""
 
     def __init__(self, *, cli: str) -> None:
         self.cli = cli
@@ -1357,25 +1353,6 @@ class AppServerCodexClient:
                 command=["codex", "app-server"],
             )
         )
-
-
-_CURRENT_HEARTBEAT: contextvars.ContextVar[Heartbeat | None] = contextvars.ContextVar(
-    "atlas_dispatch_adapter_heartbeat",
-    default=None,
-)
-
-
-@contextlib.contextmanager
-def heartbeat_context(heartbeat: Heartbeat | None):
-    token = _CURRENT_HEARTBEAT.set(heartbeat)
-    try:
-        yield
-    finally:
-        _CURRENT_HEARTBEAT.reset(token)
-
-
-def _effective_heartbeat(heartbeat: Heartbeat | None) -> Heartbeat | None:
-    return heartbeat if heartbeat is not None else _CURRENT_HEARTBEAT.get()
 
 
 def _load_cli_credentials_env(
@@ -1756,9 +1733,9 @@ def resolve_invocation(
 ) -> ResolvedInvocation:
     """Resolve argv and durable review-model evidence from the same snapshot.
 
-    Registry contents are consulted only while resolving the invocation.  The
-    returned evidence must travel with the run artifact; historical consumers
-    must never re-resolve it from today's mutable registry.
+    Registry contents are consulted only while resolving the invocation. The
+    returned evidence travels with the run artifact, so reading an old run
+    never means re-resolving it against a registry that has since changed.
     """
 
     command = render_command(
@@ -1830,7 +1807,12 @@ def _cli_env_override_name(cli: str) -> str:
     return f"ATLAS_DISPATCH_{normalized}_CMD"
 
 
-def _legacy_cli_env_override_name(cli: str) -> str:
+def _raw_cli_env_override_name(cli: str) -> str:
+    """The un-normalised name, e.g. ``ATLAS_DISPATCH_KIMI-CODE_CMD``.
+
+    Shells cannot set it, but env files and process managers can, so it is
+    accepted when the normalised name is not set.
+    """
     return f"ATLAS_DISPATCH_{cli.upper()}_CMD"
 
 
@@ -1842,9 +1824,9 @@ def _cli_env_override_value(
     value = env.get(primary)
     if value is not None:
         return value
-    legacy = _legacy_cli_env_override_name(cli)
-    if legacy != primary:
-        return env.get(legacy)
+    raw_name = _raw_cli_env_override_name(cli)
+    if raw_name != primary:
+        return env.get(raw_name)
     return None
 
 
@@ -1989,7 +1971,6 @@ class SubprocessAdapter:
         extra_env: dict[str, str] | None = None,
         heartbeat: Heartbeat | None = None,
     ) -> AdapterResult:
-        heartbeat = _effective_heartbeat(heartbeat)
         reads_stdin = self.definition.reads_prompt_from_stdin if self.definition else True
         command = render_command(
             cli=self.cli,
@@ -2833,11 +2814,14 @@ def run_cli(
     command: list[str] | None = None,
     heartbeat: Heartbeat | None = None,
 ) -> AdapterResult:
-    """Backwards-compatible wrapper kept for v0.1 callers.
+    """Run one CLI invocation in ``cwd`` and return its classified result.
 
-    New code should construct an Adapter directly.
+    Without ``command`` this is ``SubprocessAdapter(cli).run(...)``. With
+    ``command`` (an argv template, for example after MCP flags were injected)
+    the template's ``{cwd}``, ``{model}``, ``{reasoning_effort}`` and
+    ``{prompt}`` placeholders are filled and it runs through the same runtime
+    the CLI's registry entry would use.
     """
-    heartbeat = _effective_heartbeat(heartbeat)
     if command is not None:
         definition = CLIS.get(cli.lower())
         reads_stdin = definition.reads_prompt_from_stdin if definition else True
@@ -2972,8 +2956,7 @@ def classify_result(result: AdapterResult) -> Classification:
         return Classification(
             kind=DispatchErrorKind.OVERLOADED,
             suggested_action=(
-                "`codex` reported server overload (-32001). Wait and retry; "
-                "attempt-aware backoff is handled by a follow-up task."
+                "`codex` reported server overload (-32001). Wait and retry."
             ),
         )
 

@@ -18,7 +18,6 @@ from atlas_dispatch.verify import (
     VerificationState,
     VerifyReport,
     check_protected_paths,
-    parse_verification_state,
     protected_patterns,
 )
 
@@ -242,11 +241,6 @@ def test_verification_state_discriminates_no_change_and_rejects_unknown() -> Non
 
     assert no_change.verification_state is VerificationState.NOT_RUN_NO_CHANGE
     assert other_skip.verification_state is None
-    assert parse_verification_state("NOT_RUN_SPEC_DEFECT") is (
-        VerificationState.NOT_RUN_SPEC_DEFECT
-    )
-    assert parse_verification_state("verified_pass") is None
-    assert parse_verification_state(None) is None
 
 
 def test_acceptance_command_exceeds_timeout_kills_subprocess(

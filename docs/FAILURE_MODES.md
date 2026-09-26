@@ -15,6 +15,36 @@ There are three layers, and a run reports all three:
 
 ## 1. CLI classification
 
+The order of the checks, at a glance. Each box on the right lists the outcomes decided at that step,
+in the order the code checks them; the table below gives every value, its trigger and its suggested
+action.
+
+```mermaid
+flowchart TD
+    C1{"Codex lifecycle<br/>signal?"} -->|no| C2{"Quota or rate<br/>evidence?"}
+    C1 -->|"approval / idle / -32001"| L1["approval_blocked<br/>stalled<br/>overloaded"]
+    C2 -->|no| C3{"Codex turn failed<br/>or interrupted?"}
+    C2 -->|yes| L2["quota_exhausted<br/>rate_limited"]
+    C3 -->|no| C4{"Timed out or<br/>binary missing?"}
+    C3 -->|yes| L3["failed<br/>interrupted"]
+    C4 -->|no| C5{"Non-zero exit and<br/>error pattern?"}
+    C4 -->|yes| L4["timeout<br/>executable_not_found"]
+    C5 -->|no| C6{"Refusal<br/>wording?"}
+    C5 -->|"auth / rate / 5xx"| L5["auth_required<br/>rate_limited<br/>overloaded"]
+    C6 -->|no| C7{"Non-zero<br/>exit?"}
+    C6 -->|yes| L6["refused_out_of_scope<br/>refused"]
+    C7 -->|no| C8{"Model error or<br/>empty stdout?"}
+    C7 -->|"yes, deliverable proven"| OK1["success"]
+    C7 -->|yes| L7["exit_nonzero"]
+    C8 -->|yes| L8["model_selection_error<br/>no_output"]
+    C8 -->|no| OK2["success"]
+
+    classDef ok fill:#dff5e1,stroke:#2e7d32,color:#1a1a1a
+    classDef bad fill:#fde2e1,stroke:#c0392b,color:#1a1a1a
+    class OK1,OK2 ok
+    class L1,L2,L3,L4,L5,L6,L7,L8 bad
+```
+
 `classify_result()` checks conditions **in this order** and returns the first match. The order is
 the design: a timeout that also printed "rate limit" is a timeout, and a non-zero exit that mentions
 a 401 is an auth problem, not a generic failure.
@@ -62,7 +92,7 @@ done; calling that `no_change` would suggest a retry, and a retry resets the bra
 
 | Kind | Where | Trigger | Suggested action |
 |---|---|---|---|
-| `consecutive_dispatch_cap_reached` | `_dispatch_loaded_task` | The task id already has `ATLAS_DISPATCH_ABSOLUTE_RUN_CAP` run directories (default 100), or 3 runs of the same task and base in 5 minutes, or the run history cannot be read at all. | Find out why the caller keeps redispatching; set `ATLAS_DISPATCH_ALLOW_CONSECUTIVE_DISPATCH=1` for one intentional run. |
+| `consecutive_dispatch_cap_reached` | `_check_runaway_caps` | The task id already has `ATLAS_DISPATCH_ABSOLUTE_RUN_CAP` run directories (default 100), or 3 runs of the same task and base in 5 minutes, or the run history cannot be read at all. | Find out why the caller keeps redispatching; set `ATLAS_DISPATCH_ALLOW_CONSECUTIVE_DISPATCH=1` for one intentional run. |
 | `success` with `run_reuse.reused: true` | `_write_duplicate_satisfied_run` | A prior run already verified with the identical serialised task, rendered prompt and base commit. | None; the prior run's verdict is copied. Use `--no-reuse`, `reuse_policy: "never"` or `ATLAS_DISPATCH_ALLOW_DUPLICATE_RUN=1` to force a fresh run. |
 | `git_lock_contention` | `_pre_dispatch_sync_base_ref` | Git's index lock stayed held through three short retries while syncing the base. Marked `transient`. | Retry or redispatch. |
 | `dispatch_exception` | `_write_dispatch_exception_run` | Anything else that raised: a base that diverged from its remote, a dirty stale worktree, a branch with unrescued commits, a bad placeholder. The run record says whether the CLI had been invoked, and checks the remote for a published branch so work is not reported as lost when it exists. | Fix the error in `dispatch_error` and redispatch. |
@@ -84,7 +114,7 @@ floor, then the exit status.
 
 ## 3. Verification verdict
 
-`verification_verdict()` in `dispatcher.py`. `verify_passed` in `cli.summary.json` stays a boolean
+`verification_verdict()` in `reporting.py`. `verify_passed` in `cli.summary.json` stays a boolean
 for machines; the report always says which of these it means.
 
 | Verdict | When | `verify_passed` |
@@ -92,6 +122,28 @@ for machines; the report always says which of these it means.
 | `VERIFIED_PASS` | Acceptance ran and every command passed, files changed, no protected path touched, ref guard clean. | `true` |
 | `VERIFIED_FAIL` | Acceptance ran and a command failed; or it passed but a protected path was touched; or it passed but a ref outside the worktree moved. | `false` |
 | `NOT_ATTEMPTED` | Acceptance never ran (CLI failed, nothing changed, no acceptance configured, or the provenance probe refused). The report says **"not a verdict"**. | `false` |
+
+```mermaid
+flowchart TD
+    S{"Did acceptance run?"} -->|no| N1{"Files changed?"}
+    N1 -->|"no, and a ref moved"| NA1["NOT_ATTEMPTED<br/>work may be merged elsewhere"]
+    N1 -->|no| NA2["NOT_ATTEMPTED<br/>nothing was built"]
+    N1 -->|yes| NA3["NOT_ATTEMPTED<br/>could not check"]
+    S -->|yes| F{"Every command passed?"}
+    F -->|no| VF1["VERIFIED_FAIL"]
+    F -->|yes| P{"Protected path touched?"}
+    P -->|yes| VF2["VERIFIED_FAIL"]
+    P -->|no| R{"Ref guard clean?"}
+    R -->|no| VF3["VERIFIED_FAIL"]
+    R -->|yes| VP["VERIFIED_PASS"]
+
+    classDef pass fill:#dff5e1,stroke:#2e7d32,color:#1a1a1a
+    classDef fail fill:#fde2e1,stroke:#c0392b,color:#1a1a1a
+    classDef na fill:#fff4d6,stroke:#b8860b,color:#1a1a1a
+    class VP pass
+    class VF1,VF2,VF3 fail
+    class NA1,NA2,NA3 na
+```
 
 `NOT_ATTEMPTED` is deliberately distinct from `VERIFIED_FAIL`. A run killed at its timeout halfway
 through a test suite has produced no evidence that the code is wrong, and the report must not invite

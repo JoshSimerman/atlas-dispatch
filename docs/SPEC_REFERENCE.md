@@ -1,6 +1,6 @@
 # Task spec reference
 
-A task spec is one JSON object in a file. `load_task()` in `atlas_dispatch/dispatcher.py` is the
+A task spec is one JSON object in a file. `load_task()` in `atlas_dispatch/task_spec.py` is the
 source of truth for everything on this page; `atlas-dispatch run <spec.json>` loads it.
 
 Path-valued fields (`target_repo`, `prompt_template`, `context_files`, `runs_dir`) are resolved

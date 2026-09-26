@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import inspect
 import io
@@ -16,7 +15,6 @@ import sys
 import textwrap
 import threading
 import time
-import tomllib
 from collections.abc import Callable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
@@ -25,8 +23,10 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import tomllib
 
 import atlas_dispatch.dispatcher as dispatcher_mod
+import atlas_dispatch.prompt as prompt_mod
 import atlas_dispatch.verify as verify_mod
 from atlas_dispatch import (
     AdapterResult,
@@ -52,7 +52,6 @@ from atlas_dispatch.dispatcher import (
     _extend_git_info_exclude,
     _pre_dispatch_sync_base_ref,
     _prepare_mcp_runtime,
-    _render_mcp_servers,
     main,
 )
 from atlas_dispatch.worktree import verify_remote_ref_contains_sha
@@ -132,41 +131,6 @@ def _stable_ref_guard_for_mock_repository_tests(
     monkeypatch.setattr(dispatcher_mod, "_capture_orchestrator_refs", capture)
 
 
-
-
-def _write_publish_spec(
-    tmp_path: Path,
-    *,
-    title: str = "Ordinary dispatch-infra task",
-    task_id: str = "TASK-DISPATCHER",
-    worktree_branch: str = "codex/task-dispatcher",
-    tags: list[str] | None = None,
-) -> Path:
-    repo = tmp_path / "target"
-    repo.mkdir(exist_ok=True)
-    prompt = tmp_path / "prompt.md"
-    prompt.write_text("Implement {{task_summary}}.", encoding="utf-8")
-    spec: dict[str, object] = {
-        "id": task_id,
-        "title": title,
-        "target_repo": str(repo),
-        "model": "gpt-5.5",
-        "prompt_template": str(prompt),
-        "worktree_branch": worktree_branch,
-        "base_ref": "main",
-        "allowed_paths": ["atlas_dispatch/dispatcher.py"],
-        "acceptance": [".venv/bin/python -m pytest tests/test_dispatcher.py -q"],
-        "extra_prompt_vars": {"task_summary": "Verify the dispatcher pipeline."},
-    }
-    if tags is not None:
-        spec["tags"] = tags
-    spec_path = tmp_path / "publish-task.json"
-    spec_path.write_text(json.dumps(spec), encoding="utf-8")
-    return spec_path
-
-
-
-
 def _make_prompt_task(
     tmp_path: Path,
     *,
@@ -232,7 +196,7 @@ def test_pre_dispatch_sync_fast_forwards_base_ref_from_origin(tmp_path: Path) ->
             return _git_result(args)
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         _pre_dispatch_sync_base_ref(target_repo=repo, base_ref="main")
 
     assert state["head"] == "def456"
@@ -251,7 +215,7 @@ def test_pre_dispatch_sync_no_op_when_already_at_origin_head(tmp_path: Path) -> 
             return _git_result(args, stdout="def456\n")
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         _pre_dispatch_sync_base_ref(target_repo=repo, base_ref="main")
 
     assert ["merge", "--ff-only", "origin/main"] not in calls
@@ -303,7 +267,7 @@ def test_pre_dispatch_sync_retries_transient_fetch_then_succeeds(
             return _git_result(args, stdout="def456\n")
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         result = _pre_dispatch_sync_base_ref(
             target_repo=repo,
             base_ref=base_ref,
@@ -335,7 +299,7 @@ def test_pre_dispatch_sync_non_transient_fetch_failure_is_not_retried(
             )
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         with pytest.raises(
             PreDispatchGitSyncError,
             match="manual intervention required",
@@ -370,7 +334,7 @@ def test_pre_dispatch_sync_exhausts_transient_fetch_retries(
             )
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         with pytest.raises(
             PreDispatchGitSyncError,
             match="manual intervention required",
@@ -420,7 +384,7 @@ def test_pre_dispatch_sync_serializes_same_repo_checkout(
         except BaseException as exc:
             errors.append(exc)
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         threads = [threading.Thread(target=run_sync) for _ in range(2)]
         for thread in threads:
             thread.start()
@@ -448,7 +412,7 @@ def test_pre_dispatch_sync_retries_and_classifies_persistent_index_lock(
         assert args == ["checkout", "main"]
         return _git_result(args, returncode=128, stderr=index_lock_stderr)
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         with pytest.raises(PreDispatchGitSyncError) as excinfo:
             _pre_dispatch_sync_base_ref(
                 target_repo=repo,
@@ -486,7 +450,7 @@ def test_pre_dispatch_sync_normal_noop_sequence_has_no_retry_sleep(
     def unexpected_sleep(delay: float) -> None:
         raise AssertionError(f"unexpected retry sleep: {delay}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         _pre_dispatch_sync_base_ref(
             target_repo=repo,
             base_ref="main",
@@ -521,7 +485,7 @@ def test_pre_dispatch_sync_raises_on_diverged_history(tmp_path: Path) -> None:
             return _git_result(args, stdout="1\t1\n")
         raise AssertionError(f"unexpected git args: {args}")
 
-    with patch("atlas_dispatch.dispatcher._run_git", side_effect=fake_run_git):
+    with patch("atlas_dispatch.base_sync.run_git_in", side_effect=fake_run_git):
         with pytest.raises(PreDispatchGitSyncError, match="DIVERGED"):
             _pre_dispatch_sync_base_ref(target_repo=repo, base_ref="main")
 
@@ -529,7 +493,7 @@ def test_pre_dispatch_sync_raises_on_diverged_history(tmp_path: Path) -> None:
 def test_pre_dispatch_sync_unchanged_for_remote_refs(tmp_path: Path) -> None:
     repo = _repo_with_dot_git(tmp_path)
 
-    with patch("atlas_dispatch.dispatcher._run_git") as run_git:
+    with patch("atlas_dispatch.base_sync.run_git_in") as run_git:
         _pre_dispatch_sync_base_ref(target_repo=repo, base_ref="origin/foo")
 
     run_git.assert_not_called()
@@ -560,7 +524,7 @@ def test_dispatcher_git_helpers_route_through_hardened_run_git(
             return _git_result(args, stdout="abc123\n")
         raise AssertionError(f"unexpected git args: {args}")
 
-    monkeypatch.setattr(dispatcher_mod, "run_git", fake_run_git, raising=False)
+    monkeypatch.setattr("atlas_dispatch.git_exec.run_git", fake_run_git)
 
     assert dispatcher_mod._commits_ahead_of_base(repo, base_ref="main") == 3
     assert dispatcher_mod._has_uncommitted_work(repo) is True
@@ -602,7 +566,7 @@ def test_timed_out_context_does_not_hide_unfilled_placeholder(
     fifo = tmp_path / "blocked-validator-context.md"
     os.mkfifo(fifo)
     monkeypatch.setattr(
-        dispatcher_mod,
+        prompt_mod,
         "CONTEXT_FILE_READ_TIMEOUT_SECONDS",
         0.02,
     )
@@ -624,8 +588,6 @@ def test_timed_out_context_does_not_hide_unfilled_placeholder(
             os.close(writer_fd)
 
     assert "{{missing_var}}" in str(exc.value)
-
-
 
 
 def test_a_genuinely_unfilled_template_slot_must_still_raise(
@@ -778,10 +740,6 @@ class PromptValidatorCodeFenceTests:
         assert render_prompt(task) == ""
 
 
-
-
-
-
 def test_expected_review_deliverable_comes_from_agreeing_spec_fields(
     tmp_path: Path,
 ) -> None:
@@ -852,8 +810,6 @@ def test_task_spec_round_trips_protected_head_sha(tmp_path: Path) -> None:
     )
 
     assert task.protected_head_sha == protected_head_sha
-
-
 
 
 def test_acceptance_timeout_per_spec_override(tmp_path: Path) -> None:
@@ -1435,8 +1391,6 @@ def test_dispatch_refuses_fourth_consecutive_recent_dispatch_at_cap(
     )
 
 
-
-
 def test_dispatch_consecutive_cap_ignores_different_base_refs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2011,83 +1965,6 @@ def test_dispatch_serializes_concurrent_attempts_before_duplicate_check(
     assert len([path for path in (tmp_path / "runs").iterdir() if path.is_dir()]) == 2
 
 
-def _report_verify_passed(run_dir: Path) -> bool:
-    report = (run_dir / "report.md").read_text(encoding="utf-8")
-    if "- Verify passed: **True**" in report:
-        return True
-    if "- Verify passed: **False**" in report:
-        return False
-    raise AssertionError("report.md did not contain a Verify passed line")
-
-
-def _dispatch_and_capture_legacy_mcp_servers(
-    tmp_path: Path,
-    extra: dict[str, object],
-) -> list[dict[str, object]]:
-    spec_path = _write_task_spec(
-        tmp_path,
-        {
-            "cli": "kimi",
-            "runs_dir": str(tmp_path / "runs"),
-            "acceptance": ["python -c pass"],
-            **extra,
-        },
-    )
-    worktree_path = tmp_path / "worktree"
-    worktree_path.mkdir()
-    captured: dict[str, list[dict[str, object]]] = {}
-
-    def fake_write_legacy_mcp_config(
-        worktree: Path, mcp_servers: list[dict[str, object]]
-    ) -> Path:
-        captured["mcp_servers"] = mcp_servers
-        return worktree / ".atlas-dispatch-mcp.json"
-
-    with (
-        patch("atlas_dispatch.dispatcher.is_git_repo", return_value=True),
-        patch(
-            "atlas_dispatch.dispatcher.create_worktree",
-            return_value=Worktree(
-                repo_root=tmp_path / "repo",
-                worktree_path=worktree_path,
-                branch="codex/test",
-            ),
-        ),
-        patch(
-            "atlas_dispatch.dispatcher._write_legacy_mcp_config",
-            side_effect=fake_write_legacy_mcp_config,
-        ),
-        patch(
-            "atlas_dispatch.dispatcher.run_cli",
-            return_value=_successful_adapter_result("kimi"),
-        ),
-        patch("atlas_dispatch.dispatcher.commit_all", return_value=True),
-        patch(
-            "atlas_dispatch.dispatcher.list_changed_files",
-            return_value=["src/app.py"],
-        ),
-        patch(
-            # side_effect, not return_value: the real runner returns [] when it
-            # is given no commands, and a stub that always yields one passing
-            # result cannot express a spec with an empty acceptance list at all.
-            "atlas_dispatch.dispatcher.run_acceptance_commands",
-            side_effect=lambda **kwargs: (
-                [CheckResult(name="python -c pass", passed=True, details="ok")]
-                if kwargs.get("commands")
-                else []
-            ),
-        ),
-        patch(
-            "atlas_dispatch.dispatcher._resolve_verified_head_sha",
-            return_value="4e49b1d38b163c96f2ebd54248ffb720a2d9ae7a",
-        ),
-    ):
-        rc = dispatch(spec_path)
-
-    assert rc == 0
-    return captured["mcp_servers"]
-
-
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],
@@ -2119,8 +1996,6 @@ def _init_dispatch_repo(tmp_path: Path) -> Path:
     _git(repo, "commit", "-m", "base")
     _git(repo, "branch", "-M", "main")
     return repo
-
-
 
 
 def test_dispatch_records_unknown_when_worktree_disappears_before_diff(
@@ -2331,8 +2206,6 @@ def test_local_only_base_ref_preserves_no_change_classification(tmp_path: Path) 
     run_dir = next((tmp_path / "runs").iterdir())
     summary = json.loads((run_dir / "cli.summary.json").read_text(encoding="utf-8"))
     assert summary["classification"]["kind"] == "no_change"
-
-
 
 
 def test_interrupted_post_run_is_marked_incomplete_and_distinct_from_completed_no_op(
@@ -2669,8 +2542,6 @@ def test_no_change_does_not_create_empty_commit(tmp_path: Path) -> None:
     assert ahead_count == "0"
 
 
-
-
 def test_cli_artifacts_persist_sanitized_identity_and_command(tmp_path: Path) -> None:
     secret = "must-not-be-persisted"
     identity = {
@@ -2834,8 +2705,6 @@ def test_acceptance_subprocess_keeps_ambient_environment(
     assert exit_code == 0
 
 
-
-
 def test_verified_build_exit_does_not_collapse_publish_failure(
     tmp_path: Path,
 ) -> None:
@@ -2950,7 +2819,7 @@ def test_combined_diff_failure_writes_stub_and_run_succeeds(
     with (
         patch("atlas_dispatch.dispatcher.run_cli", side_effect=fake_run_cli),
         patch(
-            "atlas_dispatch.dispatcher._combined_diff_git",
+            "atlas_dispatch.run_records.run_git_in",
             side_effect=fake_combined_diff_git,
         ),
         caplog.at_level(logging.WARNING, logger="atlas_dispatch.dispatcher"),
@@ -4023,45 +3892,8 @@ def test_capabilities_prints_kimi_code_block_to_stdout() -> None:
     ) in stdout
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 class _ParserCapturedError(Exception):
     pass
-
-
-def _capture_parser_before_parse(callable_: Callable[[], object]) -> argparse.ArgumentParser:
-    captured: list[argparse.ArgumentParser] = []
-
-    def capture_parse_args(
-        self: argparse.ArgumentParser,
-        args: object = None,
-        namespace: object = None,
-    ) -> argparse.Namespace:
-        captured.append(self)
-        raise _ParserCapturedError
-
-    with patch.object(argparse.ArgumentParser, "parse_args", capture_parse_args):
-        with pytest.raises(_ParserCapturedError):
-            callable_()
-    return captured[0]
-
-
-
-
-
-
-
-
 
 
 # --------------------------------------------------------------------------- #
@@ -4214,7 +4046,7 @@ def test_dispatch_bounds_fifo_context_read_before_lock_and_reports_skip(
     os.mkfifo(fifo)
     timeout_seconds = 0.05
     monkeypatch.setattr(
-        dispatcher_mod,
+        prompt_mod,
         "CONTEXT_FILE_READ_TIMEOUT_SECONDS",
         timeout_seconds,
     )
@@ -4456,8 +4288,6 @@ def test_red_run_is_still_published_preservation_is_not_approval(tmp_path: Path)
         run_dir=run_dir,
         task=task,
         worktree=build,
-        verification_passed=False,   # RED
-        cli_succeeded=False,         # RED
     )
 
     assert result is not None
@@ -4514,8 +4344,6 @@ def test_string_prompt_vars_are_still_substituted_verbatim(tmp_path: Path) -> No
     task.extra_prompt_vars.update({"task_summary": "  spaced\nlines  "})
 
     assert render_prompt(task) == "[  spaced\nlines  ]"
-
-
 
 
 def test_acceptance_skip_reason_no_acceptance_configured(tmp_path: Path) -> None:

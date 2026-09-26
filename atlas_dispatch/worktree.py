@@ -9,21 +9,20 @@ before the CLI run and leaves it intact afterwards so the human reviewer
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from contextlib import contextmanager
-from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
 import logging
-import os
 import re
 import shlex
 import shutil
 import socket
 import subprocess
 import tempfile
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -1392,29 +1391,6 @@ def _editable_requirement_spec(requirement: str) -> str | None:
         if requirement.startswith(prefix):
             return requirement.removeprefix(prefix).strip()
     return None
-
-
-def _remap_direct_url_requirement(
-    repo_root: Path, worktree_path: Path, requirement: str
-) -> str:
-    name, separator, url = requirement.partition(" @ ")
-    if not separator:
-        return requirement
-    remapped = _remap_requirement_path(repo_root, worktree_path, url)
-    if remapped == url:
-        return requirement
-    return f"{name}{separator}{Path(remapped).resolve().as_uri()}"
-
-
-def _remap_requirement_path(repo_root: Path, worktree_path: Path, spec: str) -> str:
-    source_path = _requirement_file_path(spec)
-    if source_path is None:
-        return spec
-    try:
-        relative = source_path.resolve().relative_to(repo_root.resolve())
-    except ValueError:
-        return spec
-    return str((worktree_path / relative).resolve())
 
 
 def _requirement_file_path(spec: str) -> Path | None:
