@@ -1,0 +1,32 @@
+{
+  "id": "EX-003",
+  "title": "Document the public API of the HTTP client",
+  "target_repo": "my-service",
+  "cli": "claude",
+  "model_id": "claude-sonnet-5",
+  "reasoning_effort": null,
+  "prompt_template": "../prompts/implement.md",
+  "worktree_branch": "claude/ex-003-http-client-docs",
+  "base_ref": "main",
+  "allowed_paths": [
+    "docs/http_client.md"
+  ],
+  "forbidden_paths": [
+    "src/**"
+  ],
+  "mcp_servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  ],
+  "acceptance": [
+    "test -s docs/http_client.md"
+  ],
+  "timeout_seconds": 900,
+  "extra_prompt_vars": {
+    "task_summary": "Write docs/http_client.md: one section per public method of HttpClient with its signature, behaviour, errors raised and a short example. Read the source; do not guess.",
+    "shape_guidance": "Markdown only. Do not edit any source file."
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "EX-002",
+  "title": "Independent review of EX-001 (retry with backoff)",
+  "target_repo": "my-service",
+  "model": "kimi/k2.7-coding",
+  "prompt_template": "../prompts/review.md",
+  "worktree_branch": "kimi/ex-002-review-of-ex-001",
+  "base_ref": "codex/ex-001-http-retry",
+  "reuse_policy": "never",
+  "allowed_paths": [
+    "reviews/EX-001-kimi.md"
+  ],
+  "forbidden_paths": [
+    "src/**",
+    "tests/**"
+  ],
+  "acceptance": [
+    "test -f reviews/EX-001-kimi.md"
+  ],
+  "timeout_seconds": 1500,
+  "extra_prompt_vars": {
+    "review_output_path": "reviews/EX-001-kimi.md",
+    "source_task_id": "EX-001",
+    "source_branch": "codex/ex-001-http-retry",
+    "source_changed_files": "- `src/my_service/http_client.py`\n- `tests/test_http_client.py`"
+  }
+}

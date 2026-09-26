@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-dispatch"
+version = "1.0.0"
+description = "Run coding-agent CLIs (Codex, Claude Code, Gemini, Kimi, Grok, Hermes) as implementers in isolated git worktrees, then verify, classify and report on what they did."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Josh Simerman" }]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+atlas-dispatch = "atlas_dispatch.cli:main"
+
+[tool.setuptools]
+packages = ["atlas_dispatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

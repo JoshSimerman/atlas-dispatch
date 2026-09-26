@@ -1,0 +1,30 @@
+{
+  "id": "EX-001",
+  "title": "Add retry with exponential backoff to the HTTP client",
+  "target_repo": "my-service",
+  "model": "codex/gpt-6-sol-high",
+  "prompt_template": "../prompts/implement.md",
+  "worktree_branch": "codex/ex-001-http-retry",
+  "base_ref": "main",
+  "allowed_paths": [
+    "src/my_service/http_client.py",
+    "tests/test_http_client.py"
+  ],
+  "forbidden_paths": [
+    "src/my_service/settings.py",
+    "pyproject.toml"
+  ],
+  "acceptance": [
+    ".venv/bin/python -m pytest tests/test_http_client.py -q",
+    ".venv/bin/python -m pytest -q"
+  ],
+  "acceptance_min_collected": {
+    ".venv/bin/python -m pytest tests/test_http_client.py -q": 5
+  },
+  "timeout_seconds": 1800,
+  "push_branch": false,
+  "extra_prompt_vars": {
+    "task_summary": "Wrap `HttpClient.get` in a retry loop: up to 3 attempts on connection errors and HTTP 502/503/504, with exponential backoff starting at 0.5s and full jitter. Do not retry any other 4xx or 5xx. Add tests that inject a fake transport; do not sleep for real in tests.",
+    "shape_guidance": "Keep the public signature of `HttpClient.get` unchanged. No new dependencies. Put the backoff calculation in a small pure function so it can be tested directly."
+  }
+}
